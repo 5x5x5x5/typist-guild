@@ -255,7 +255,7 @@ function initFilter() {
   });
 }
 
-fetch("data.json")
+fetch("/api/v1/board")
   .then((res) => {
     if (!res.ok) throw new Error(res.status);
     return res.json();

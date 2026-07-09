@@ -1,0 +1,22 @@
+{
+  "name": "typist-guild",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "assets": {
+    "directory": "site",
+    "binding": "ASSETS"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "typist-guild",
+      // Placeholder until `wrangler d1 create typist-guild` (Phase B); local
+      // dev and tests use miniflare's local D1 and never read this id.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
