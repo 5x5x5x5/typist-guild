@@ -32,14 +32,14 @@ A bundle is a single UTF-8 JSON file. Top level:
 |---|---|---|---|
 | `schema` | integer | MUST | Major schema version. This document defines `1`. |
 | `generator` | string | SHOULD | Emitting tool and version, `name/semver`. Diagnostic only; consumers MUST NOT branch on it. |
-| `user` | string | MUST | GitHub login of the owner. Consumers that accept submissions MUST verify this against the authenticated submitter and MUST NOT trust it bare. |
+| `user` | string | SHOULD | GitHub login of the owner. When present, consumers that accept submissions MUST verify it against the authenticated submitter and reject on mismatch. When absent, the submission is attributed to the authenticated submitter. |
 | `sessions` | array | MUST | Zero or more session records (§3). Order is not significant. |
 
 Unknown top-level fields MUST be preserved by tools that rewrite bundles and MUST be ignored by consumers.
 
 ## 3. Session record
 
-One record per typing session. A session begins when the typing buffer opens and ends at `:GT stop`, buffer close, or Vim exit.
+One record per typing session. A session begins when the typing buffer opens and ends at `:GT stop`, buffer close, or Vim exit. Emitters MUST export only closed sessions; a session still in progress at export time is excluded (its record is not yet immutable, §4).
 
 ```json
 {
@@ -91,12 +91,12 @@ These definitions are normative for schema 1. A change to any of them is a major
 
 ### 5.1 Active time
 
-Active time is wall time minus idle gaps. A gap between consecutive keystrokes longer than **5 seconds** is excluded in full. The 5s threshold is part of the schema; emitters MUST NOT make it configurable in a way that affects exported values.
+Active time is wall time minus idle gaps. A gap between consecutive input events longer than **5 seconds** is excluded in full. The 5s threshold is part of the schema; emitters MUST NOT make it configurable in a way that affects exported values. Emitters measure at input-event granularity (in gutenberg-typist, buffer text-change events), which is keystroke-granularity during typing.
 
 ### 5.2 Character accounting
 
 - `chars_typed`: number of source-text positions the cursor legitimately advanced past. Whitespace and punctuation count; a character re-typed after correction counts once.
-- `errors_uncorrected`: positions where the final typed character differs from the source. (In gutenberg-typist's current UI the cursor cannot advance past a mismatch, so this is normally 0; the field exists so alternative emitters and future modes are representable.)
+- `errors_uncorrected`: positions where the final typed character differs from the source. (In gutenberg-typist's UI a mismatch highlights red but does not block the cursor, so nonzero values are normal; a typist who corrects every red character before finishing ends at 0.)
 - `corrections`: number of backspace-and-retype events resolving to a correct character.
 
 ### 5.3 Derived metrics (informative)
@@ -137,4 +137,18 @@ Flagged records feed the existing `?` badge mechanism. Plausibility checks are a
 
 ## 9. Migration from bundle v0 (field-wise-max counters)
 
-Legacy lifetime-counter bundles cannot be losslessly converted to sessions. The migration is: emit one **synthetic session per (machine)** carrying the legacy totals, with `id` derived deterministically as UUIDv5 of `(user, machine, "legacy-v0")`, `date` set to the migration date, and a `"legacy": true` marker field. Consumers SHOULD display legacy records in lifetime totals but exclude them from time-series and per-session leaderboards. New exports append real sessions alongside.
+Legacy lifetime-counter bundles cannot be losslessly converted to sessions. The migration is: emit one **synthetic session per machine** carrying the legacy totals, with `id` derived deterministically as UUIDv5 of `machine + "\n" + "legacy-v0"` under the fixed GT namespace UUID `8c8f6a1e-2b7d-4f5a-9c3e-747970697374`, `date` set to the migration date, and a `"legacy": true` marker field. Consumers SHOULD display legacy records in lifetime totals but exclude them from time-series and per-session leaderboards.
+
+Migration runs exactly once, **on the machine that owns the counters** (where the authoritative `lifetime_stats.json` lives). Old-format (v0 `format_version`) bundles are not importable elsewhere: a stale v0 export migrated on a second machine would mint the same deterministic `id` with different totals — the one conflict §4 forbids. Importers encountering a v0 bundle MUST refuse with guidance to update the plugin on the source machine and re-export. New exports append real sessions alongside the legacy record.
+
+---
+
+## Changelog (draft → 1.0)
+
+Amendments made during implementation, per repo owner's ruling; each is a reviewable diff against the draft as first committed.
+
+1. **§2 `user`: MUST → SHOULD.** The authentication token *is* the identity; requiring the login in the file forces every emitter to learn a fact only the server holds, adding a config knob and a mismatch failure mode. Verification rule kept: present-and-wrong is a rejection.
+2. **§3: emitters export only closed sessions.** An in-progress session's record would mutate on re-export, violating §4 immutability.
+3. **§5.1: "keystrokes" → "input events".** Emitters measure idle gaps at input-event granularity; gutenberg-typist observes buffer text-change events, not raw keystrokes.
+4. **§5.2 parenthetical corrected.** The draft claimed gutenberg-typist's cursor cannot advance past a mismatch; the shipped UI highlights mismatches red and does not block, so nonzero `errors_uncorrected` is the normal case.
+5. **§9: legacy id drops `user` from the UUIDv5 name; fixed namespace pinned.** The owning machine may not know the GitHub login at migration time, and cross-user id collisions are harmless because consumers key sessions per authenticated user. Migration is restricted to the owning machine and v0 bundles are refused by importers, making the deterministic-id/differing-totals conflict unreachable.
