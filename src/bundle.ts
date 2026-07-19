@@ -1,32 +1,210 @@
-// Port of build.py's pure validate/merge/derive functions. build.py is the
-// reference implementation (it still builds the git-era archive); the parity
-// suite in test/bundle.spec.ts mirrors tests/test_build.py case-for-case.
-// If you change semantics here, change build.py and both suites together.
+// SPEC.md schema 1: a bundle is a set of immutable session records; merge is
+// set union by id. Validation splits per §6 — structural problems reject the
+// whole bundle, plausibility problems flag the record (the "?" badge).
+// Keep this file, the plugin's storage.vim, and both test suites in lockstep
+// with SPEC.md.
 
-export const FORMAT_VERSION = 1;
+export const SCHEMA_VERSION = 1;
 export const MAX_BUNDLE_BYTES = 1_000_000;
-export const SUSPICIOUS_WPM = 250;
-const MAX_MACHINE_ID_CHARS = 40;
+export const PLAUSIBLE_WPM_CEILING = 300; // §6
+export const MIN_BEST_SESSION_ACTIVE_MS = 10_000; // consumer rule: sub-10s flukes never set bests
 
-export type Counters = Record<string, number>;
-export type Machines = Record<string, Counters>;
-export interface Session {
-  book_id: number;
-  offset: number;
-  total_chars_typed?: number;
-  correct_chars?: number;
-  last_active?: number;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const DATE_RE = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$/;
+const MAX_MACHINE_CHARS = 100;
+const MAX_TITLE_CHARS = 200;
+
+export interface SessionRecord {
+  id: string;
+  machine: string;
+  date: string;
+  book?: { gutenberg_id: number; title?: string }; // absent only on legacy records (§9)
+  range?: { start: number; end: number };
+  active_ms: number;
+  wall_ms: number;
+  chars_typed: number;
+  errors_uncorrected: number;
+  corrections?: number;
+  legacy?: boolean;
+  [key: string]: unknown; // unknown fields are preserved (§2)
 }
-export type Sessions = Record<string, Session>;
 
-export interface CleanBundle {
-  machines: Machines;
-  sessions: Sessions;
-  exported_at: number;
+export interface ParsedBundle {
+  user?: string;
+  sessions: SessionRecord[];
+}
+
+const isObj = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+const isNonNegInt = (v: unknown): v is number =>
+  typeof v === "number" && Number.isInteger(v) && v >= 0;
+
+// Sorted-keys, no-whitespace JSON (§4). Record identity conflicts are a
+// string compare of this; the seed generator's json.dumps(sort_keys=True,
+// separators=(",",":"), ensure_ascii=False) is the same algorithm.
+export function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return "[" + value.map(canonicalJson).join(",") + "]";
+  }
+  if (isObj(value)) {
+    return (
+      "{" +
+      Object.keys(value)
+        .sort()
+        .map((k) => JSON.stringify(k) + ":" + canonicalJson(value[k]))
+        .join(",") +
+      "}"
+    );
+  }
+  return JSON.stringify(value);
+}
+
+// Structural check of one record (§3, §6). Returns a reason or null.
+function recordError(raw: unknown): string | null {
+  if (!isObj(raw)) return "record is not an object";
+  if (typeof raw.id !== "string" || !UUID_RE.test(raw.id))
+    return "id must be a lowercase UUID";
+  if (
+    typeof raw.machine !== "string" ||
+    raw.machine.length === 0 ||
+    [...raw.machine].length > MAX_MACHINE_CHARS
+  )
+    return "machine must be a 1-100 character string";
+  if (typeof raw.date !== "string" || !DATE_RE.test(raw.date))
+    return "date must be a valid YYYY-MM-DD";
+  if (raw.legacy !== undefined && typeof raw.legacy !== "boolean")
+    return "legacy must be a boolean";
+  if (raw.book === undefined) {
+    if (raw.legacy !== true) return "book is required on non-legacy records";
+  } else {
+    if (!isObj(raw.book)) return "book must be an object";
+    if (!isNonNegInt(raw.book.gutenberg_id))
+      return "book.gutenberg_id must be a non-negative integer";
+    if (
+      raw.book.title !== undefined &&
+      (typeof raw.book.title !== "string" ||
+        [...raw.book.title].length > MAX_TITLE_CHARS)
+    )
+      return "book.title must be a string of at most 200 characters";
+  }
+  if (raw.range !== undefined) {
+    if (
+      !isObj(raw.range) ||
+      !isNonNegInt(raw.range.start) ||
+      !isNonNegInt(raw.range.end)
+    )
+      return "range must be {start, end} with non-negative integers";
+    if (raw.range.end < raw.range.start)
+      return "range.end must not be less than range.start";
+  }
+  for (const key of [
+    "active_ms",
+    "wall_ms",
+    "chars_typed",
+    "errors_uncorrected",
+  ] as const) {
+    if (!isNonNegInt(raw[key])) return `${key} must be a non-negative integer`;
+  }
+  if (raw.corrections !== undefined && !isNonNegInt(raw.corrections))
+    return "corrections must be a non-negative integer";
+  return null;
+}
+
+export function parseBundle(text: string): {
+  bundle: ParsedBundle | null;
+  error: string | null;
+} {
+  const fail = (error: string) => ({ bundle: null, error });
+  if (new TextEncoder().encode(text).length > MAX_BUNDLE_BYTES) {
+    return fail("bundle larger than 1 MB");
+  }
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return fail("unreadable (not valid JSON)");
+  }
+  if (!isObj(data)) return fail("not a JSON object");
+  if (data.schema !== SCHEMA_VERSION) {
+    if (typeof data.schema === "number" && data.schema > SCHEMA_VERSION) {
+      return fail(
+        `schema ${data.schema} not supported — this guild understands schema ${SCHEMA_VERSION}`,
+      );
+    }
+    return fail("not a schema-1 bundle");
+  }
+  if (data.user !== undefined && typeof data.user !== "string") {
+    return fail("user must be a string");
+  }
+  if (!Array.isArray(data.sessions)) return fail("sessions must be an array");
+
+  const byId = new Map<string, { record: SessionRecord; canonical: string }>();
+  for (const [i, raw] of data.sessions.entries()) {
+    const err = recordError(raw);
+    if (err !== null) return fail(`sessions[${i}]: ${err}`);
+    const record = raw as SessionRecord;
+    const canonical = canonicalJson(record);
+    const seen = byId.get(record.id);
+    if (seen) {
+      if (seen.canonical !== canonical) {
+        // §4: same id, different content — a record is immutable once created.
+        return fail(
+          `sessions[${i}]: duplicate id ${record.id} with different content`,
+        );
+      }
+      continue; // byte-identical duplicate: union makes it a no-op
+    }
+    byId.set(record.id, { record, canonical });
+  }
+
+  return {
+    bundle: {
+      ...(typeof data.user === "string" && { user: data.user }),
+      sessions: [...byId.values()].map((v) => v.record),
+    },
+    error: null,
+  };
+}
+
+// §5.3. Zero active time yields 0 rather than dividing by zero; the
+// zero-active-with-chars case is flagged by isImplausible instead.
+export function grossWpm(r: SessionRecord): number {
+  return r.active_ms > 0 ? r.chars_typed / 5 / (r.active_ms / 60_000) : 0;
+}
+
+// §6 plausibility. Advisory: feeds the "?" badge, never rejects. The
+// chars_typed-vs-book-length check is skipped — the server has no book texts.
+export function isImplausible(r: SessionRecord): boolean {
+  if (r.active_ms > r.wall_ms) return true;
+  if (r.errors_uncorrected > r.chars_typed) return true;
+  if (r.range) {
+    const span = r.range.end - r.range.start;
+    if (Math.abs(span - r.chars_typed) > 0.1 * r.chars_typed) return true;
+  }
+  if (r.active_ms === 0 && r.chars_typed > 0) return true;
+  return grossWpm(r) > PLAUSIBLE_WPM_CEILING;
+}
+
+export interface MachineSummary {
+  chars: number;
+  hours: number;
+  sessions: number;
+  best_wpm: number;
+}
+
+export interface BookSummary {
+  book_id: number;
+  title: string;
+  chars: number;
+  sessions: number;
+  last_date: string;
 }
 
 export interface Row {
   user: string;
+  seed: boolean;
   best_wpm: number;
   avg_wpm: number;
   accuracy: number;
@@ -35,169 +213,107 @@ export interface Row {
   sessions: number;
   books: number;
   machines_count: number;
-  exported_at: number;
+  last_date: string;
   suspicious: boolean;
-  machines: Machines;
-  books_detail: Session[];
+  machines: Record<string, MachineSummary>;
+  books_detail: BookSummary[];
 }
 
-// Coerce a JSON value to a non-negative int; reject everything else.
-// (JSON.parse cannot produce Infinity/NaN, unlike Python's json.loads —
-// those inputs already fail at the parse step here, same net rejection.)
-function asInt(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value)) return null;
-  const n = Math.round(value);
-  return n >= 0 ? n : null;
-}
+const round1 = (x: number) => Math.round(x * 10) / 10;
 
-// Machine ids are user-controlled free text shown verbatim on the board:
-// cap the length and drop non-printable characters before display.
-// \p{C} = control/format/unassigned, \p{Z} = separators (space kept).
-export function sanitizeMachineId(machineId: string): string {
-  const cleaned = [...machineId]
-    .filter((ch) => ch === " " || !/[\p{C}\p{Z}]/u.test(ch))
-    .join("")
-    .trim();
-  return [...cleaned].slice(0, MAX_MACHINE_ID_CHARS).join("");
-}
-
-function cleanMachines(raw: unknown): Machines {
-  const machines: Machines = {};
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw))
-    return machines;
-  for (const [rawId, record] of Object.entries(raw)) {
-    if (typeof record !== "object" || record === null || Array.isArray(record))
-      continue;
-    const machineId = sanitizeMachineId(rawId);
-    if (machineId === "") continue;
-    const clean: Counters = {};
-    for (const [key, value] of Object.entries(record)) {
-      const n = asInt(value);
-      if (n !== null) clean[key] = n;
-    }
-    if (Object.keys(clean).length) machines[machineId] = clean;
+// A legacy record stands in for its machine's whole v0 history; its
+// preserved counter map says how many sessions that was (§9).
+function sessionsRepresented(r: SessionRecord): number {
+  if (r.legacy !== true) return 1;
+  const lc = r["legacy_counters"];
+  if (isObj(lc)) {
+    const n = lc.sessions_count;
+    if (typeof n === "number" && Number.isFinite(n) && n > 0)
+      return Math.round(n);
   }
-  return machines;
+  return 1;
 }
 
-function cleanSessions(raw: unknown): Sessions {
-  const sessions: Sessions = {};
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw))
-    return sessions;
-  for (const [bookId, record] of Object.entries(raw)) {
-    // ASCII digits only — JS \d is ASCII-only, mirroring the plugin's '^\d\+$'
-    if (!/^\d+$/.test(bookId)) continue;
-    if (typeof record !== "object" || record === null || Array.isArray(record))
-      continue;
-    const rec = record as Record<string, unknown>;
-    const offset = asInt(rec.offset);
-    if (offset === null) continue;
-    const clean: Session = { book_id: Number(bookId), offset };
-    for (const key of [
-      "total_chars_typed",
-      "correct_chars",
-      "last_active",
-    ] as const) {
-      const n = asInt(rec[key]);
-      if (n !== null) clean[key] = n;
-    }
-    sessions[bookId] = clean;
-  }
-  return sessions;
-}
+const setsBest = (r: SessionRecord): boolean =>
+  r.legacy !== true && r.active_ms >= MIN_BEST_SESSION_ACTIVE_MS;
 
-// Field-wise max over the union of keys — mirrors autoload/gt/storage.vim.
-export function mergeMachines(local: Machines, incoming: Machines): Machines {
-  const merged: Machines = Object.fromEntries(
-    Object.entries(local).map(([id, rec]) => [id, { ...rec }]),
-  );
-  for (const [machineId, record] of Object.entries(incoming)) {
-    const current = (merged[machineId] ??= {});
-    for (const [key, value] of Object.entries(record)) {
-      current[key] = Math.max(current[key] ?? 0, value);
+export function deriveRow(
+  login: string,
+  seed: boolean,
+  records: Array<SessionRecord & { flagged: boolean }>,
+): Row {
+  let chars = 0;
+  let errors = 0;
+  let corrections = 0;
+  let activeMs = 0;
+  let sessions = 0;
+  let best = 0;
+  let lastDate = "";
+  let suspicious = false;
+  const machines: Record<string, MachineSummary> = {};
+  const books = new Map<number, BookSummary>();
+
+  for (const r of records) {
+    chars += r.chars_typed;
+    errors += r.errors_uncorrected;
+    corrections += r.corrections ?? 0;
+    activeMs += r.active_ms;
+    sessions += sessionsRepresented(r);
+    if (setsBest(r)) best = Math.max(best, grossWpm(r));
+    if (r.date > lastDate) lastDate = r.date;
+    suspicious = suspicious || r.flagged;
+
+    const m = (machines[r.machine] ??= {
+      chars: 0,
+      hours: 0,
+      sessions: 0,
+      best_wpm: 0,
+    });
+    m.chars += r.chars_typed;
+    m.hours += r.active_ms; // ms until the rounding pass below
+    m.sessions += sessionsRepresented(r);
+    if (setsBest(r)) m.best_wpm = Math.max(m.best_wpm, Math.round(grossWpm(r)));
+
+    if (r.book && r.legacy !== true) {
+      const b = books.get(r.book.gutenberg_id) ?? {
+        book_id: r.book.gutenberg_id,
+        title: "",
+        chars: 0,
+        sessions: 0,
+        last_date: "",
+      };
+      if (r.book.title) b.title = r.book.title;
+      b.chars += r.chars_typed;
+      b.sessions += 1;
+      if (r.date > b.last_date) b.last_date = r.date;
+      books.set(r.book.gutenberg_id, b);
     }
   }
-  return merged;
-}
+  for (const m of Object.values(machines))
+    m.hours = round1(m.hours / 3_600_000);
 
-// Newer last_active wins; ties keep local — mirrors gt#storage#MergeSession.
-export function mergeSessions(local: Sessions, incoming: Sessions): Sessions {
-  const merged: Sessions = { ...local };
-  for (const [bookId, record] of Object.entries(incoming)) {
-    const current = merged[bookId];
-    if (
-      current === undefined ||
-      (record.last_active ?? 0) > (current.last_active ?? 0)
-    ) {
-      merged[bookId] = record;
-    }
-  }
-  return merged;
-}
-
-export function loadBundle(text: string): {
-  bundle: CleanBundle | null;
-  error: string | null;
-} {
-  if (new TextEncoder().encode(text).length > MAX_BUNDLE_BYTES) {
-    return { bundle: null, error: "bundle larger than 1 MB" };
-  }
-  let data: unknown;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    return { bundle: null, error: "unreadable (not valid JSON)" };
-  }
-  if (typeof data !== "object" || data === null || Array.isArray(data)) {
-    return { bundle: null, error: "not a JSON object" };
-  }
-  const obj = data as Record<string, unknown>;
-  if (obj.format_version !== FORMAT_VERSION) {
-    return {
-      bundle: null,
-      error: `format_version ${JSON.stringify(obj.format_version)} not supported`,
-    };
-  }
-  const machines = cleanMachines(obj.machines);
-  if (!Object.keys(machines).length) {
-    return { bundle: null, error: "no valid machine records" };
-  }
+  const minutes = activeMs / 60_000;
+  const accuracyDenom = chars + corrections;
   return {
-    bundle: {
-      machines,
-      sessions: cleanSessions(obj.sessions),
-      exported_at: asInt(obj.exported_at) ?? 0,
-    },
-    error: null,
-  };
-}
-
-export function derive(user: string, bundle: CleanBundle): Row {
-  const machines = bundle.machines;
-  const records = Object.values(machines);
-  const sum = (key: string) =>
-    records.reduce((acc, r) => acc + (r[key] ?? 0), 0);
-  const chars = sum("total_chars");
-  const correct = sum("correct_chars");
-  const seconds = sum("total_time_seconds");
-  const minutes = seconds / 60;
-  const bestWpm = records.reduce((acc, r) => Math.max(acc, r.best_wpm ?? 0), 0);
-  const round1 = (x: number) => Math.round(x * 10) / 10;
-  return {
-    user,
-    best_wpm: bestWpm,
+    user: login,
+    seed,
+    best_wpm: Math.round(best),
     avg_wpm: round1(minutes > 0 ? chars / 5 / minutes : 0),
-    accuracy: round1(chars > 0 ? (correct * 100) / chars : 0),
-    hours: round1(seconds / 3600),
+    accuracy: round1(
+      accuracyDenom > 0 ? ((chars - errors) * 100) / accuracyDenom : 0,
+    ),
+    hours: round1(activeMs / 3_600_000),
     total_chars: chars,
-    sessions: sum("sessions_count"),
-    books: Object.keys(bundle.sessions).length,
-    machines_count: records.length,
-    exported_at: bundle.exported_at,
-    suspicious: bestWpm > SUSPICIOUS_WPM || correct > chars,
+    sessions,
+    books: books.size,
+    machines_count: Object.keys(machines).length,
+    last_date: lastDate,
+    suspicious,
     machines,
-    books_detail: Object.values(bundle.sessions).sort(
-      (a, b) => (b.last_active ?? 0) - (a.last_active ?? 0),
+    books_detail: [...books.values()].sort((a, b) =>
+      a.last_date === b.last_date
+        ? b.chars - a.chars
+        : b.last_date.localeCompare(a.last_date),
     ),
   };
 }
