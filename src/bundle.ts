@@ -234,8 +234,11 @@ function sessionsRepresented(r: SessionRecord): number {
   return 1;
 }
 
-const setsBest = (r: SessionRecord): boolean =>
-  r.legacy !== true && r.active_ms >= MIN_BEST_SESSION_ACTIVE_MS;
+// Consumer display rule: legacy history, sub-10s flukes, and flagged
+// (implausible) records never set bests — a fabricated 320-wpm session
+// earns the "?" badge without also topping the board.
+const setsBest = (r: SessionRecord & { flagged: boolean }): boolean =>
+  r.legacy !== true && !r.flagged && r.active_ms >= MIN_BEST_SESSION_ACTIVE_MS;
 
 export function deriveRow(
   login: string,

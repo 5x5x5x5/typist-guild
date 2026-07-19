@@ -268,6 +268,25 @@ describe("deriveRow (§5.3)", () => {
     expect(row.books_detail[1].title).toBe("Pride and Prejudice");
   });
 
+  it("excludes flagged records from best_wpm (badge without the crown)", () => {
+    const row = deriveRow("uriah", false, [
+      flag(),
+      flag(
+        {
+          active_ms: 480_000,
+          wall_ms: 480_000,
+          chars_typed: 25_600, // 320 wpm
+          errors_uncorrected: 0,
+          corrections: 0,
+          range: { start: 0, end: 25_600 },
+        },
+        true,
+      ),
+    ]);
+    expect(row.best_wpm).toBe(60);
+    expect(row.suspicious).toBe(true);
+  });
+
   it("excludes sub-10s sessions from best_wpm", () => {
     const row = deriveRow("u", false, [
       flag(),
