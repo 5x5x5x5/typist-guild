@@ -9,8 +9,7 @@ const COLUMNS = [
   { key: "total_chars", label: "chars", fmt: (v) => v.toLocaleString("en-US") },
   { key: "sessions", label: "sessions" },
   { key: "books", label: "books" },
-  { key: "machines_count", label: "machines" },
-  { key: "exported_at", label: "updated", fmt: relativeTime },
+  { key: "last_date", label: "last day", fmt: (v) => v || "—" },
 ];
 
 let state = {
@@ -96,9 +95,9 @@ function foldCell(row) {
         el("span", {
           className: "muted",
           textContent:
-            `${(rec.total_chars || 0).toLocaleString("en-US")} chars · ` +
-            `${Math.round(((rec.total_time_seconds || 0) / 3600) * 10) / 10} h · ` +
-            `best ${rec.best_wpm || 0} wpm · ${rec.sessions_count || 0} sessions`,
+            `${(rec.chars || 0).toLocaleString("en-US")} chars · ` +
+            `${rec.hours || 0} h · ` +
+            `best ${rec.best_wpm || 0} wpm · ${rec.sessions || 0} sessions`,
         }),
       ]),
     );
@@ -107,7 +106,7 @@ function foldCell(row) {
   for (const book of row.books_detail) {
     const link = el("a", {
       href: "https://www.gutenberg.org/ebooks/" + book.book_id,
-      textContent: "#" + book.book_id,
+      textContent: book.title || "#" + book.book_id,
       target: "_blank",
       rel: "noopener",
     });
@@ -117,8 +116,9 @@ function foldCell(row) {
         el("span", {
           className: "muted",
           textContent:
-            ` · ${(book.offset || 0).toLocaleString("en-US")} chars in` +
-            (book.last_active ? ` · ${relativeTime(book.last_active)}` : ""),
+            ` · ${(book.chars || 0).toLocaleString("en-US")} chars · ` +
+            `${book.sessions || 0} sessions` +
+            (book.last_date ? ` · ${book.last_date}` : ""),
         }),
       ]),
     );
@@ -166,13 +166,17 @@ function renderBody(tbody) {
       const td = el("td");
       if (col.key === "user") {
         td.className = "user";
+        // Seed users (negative ids, openly fictional) are never linked:
+        // their names are not GitHub accounts and must point at no one.
         td.append(
-          el("a", {
-            href: "https://github.com/" + encodeURIComponent(row.user),
-            textContent: row.user,
-            target: "_blank",
-            rel: "noopener",
-          }),
+          row.seed
+            ? el("span", { textContent: row.user })
+            : el("a", {
+                href: "https://github.com/" + encodeURIComponent(row.user),
+                textContent: row.user,
+                target: "_blank",
+                rel: "noopener",
+              }),
         );
         if (row.suspicious) {
           td.append(
@@ -276,5 +280,5 @@ fetch("/api/v1/board")
   })
   .catch(() => {
     document.getElementById("error").hidden = false;
-    document.getElementById("meta").textContent = "data.json failed to load";
+    document.getElementById("meta").textContent = "board failed to load";
   });
