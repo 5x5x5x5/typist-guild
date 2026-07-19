@@ -61,11 +61,11 @@ One record per typing session. A session begins when the typing buffer opens and
 | `id` | string (UUIDv4) | MUST | Assigned once at session creation and persisted in the local session file. It MUST NOT change on re-export. This is the identity for merge (§4). |
 | `machine` | string | MUST | Emitting machine label. Defaults to hostname; users MAY override via `g:gt_machine_id`. Emitters SHOULD warn when the default hostname is exported. |
 | `date` | string | MUST | Local calendar date of session start, `YYYY-MM-DD`. Precise start/end times MUST NOT be exported (they publish daily routine). Emitters MAY keep precise times locally. |
-| `book` | object | MUST | `gutenberg_id` (integer, MUST); `title` (string, SHOULD — convenience only, id is authoritative). |
+| `book` | object | MUST | `gutenberg_id` (integer, MUST); `title` (string, SHOULD — convenience only, id is authoritative). Omitted entirely — along with `range` — on `legacy: true` records (§9), which carry no per-book data. |
 | `range` | object | SHOULD | Zero-based character offsets `[start, end)` into the cleaned book text covered by the session. Enables per-book progress and difficulty analysis. |
 | `active_ms` | integer | MUST | Active typing time in milliseconds (§5.1). |
 | `wall_ms` | integer | MUST | Wall-clock session duration in milliseconds. `active_ms <= wall_ms`. |
-| `chars_typed` | integer | MUST | Count of source characters advanced past, i.e. correct-final characters (§5.2). |
+| `chars_typed` | integer | MUST | Count of source characters advanced past — the final transcript length, whether or not each final character matches the source (§5.2). |
 | `errors_uncorrected` | integer | MUST | Characters wrong in the final transcript (§5.2). |
 | `corrections` | integer | SHOULD | Characters that were typed wrong and then fixed. Distinguishes clean typists from fast-but-sloppy ones. |
 
@@ -95,7 +95,7 @@ Active time is wall time minus idle gaps. A gap between consecutive input events
 
 ### 5.2 Character accounting
 
-- `chars_typed`: number of source-text positions the cursor legitimately advanced past. Whitespace and punctuation count; a character re-typed after correction counts once.
+- `chars_typed`: number of source-text positions the cursor legitimately advanced past — the final transcript length. Whitespace and punctuation count; a character re-typed after correction counts once; positions whose final character is wrong still count (they are the `errors_uncorrected` subset).
 - `errors_uncorrected`: positions where the final typed character differs from the source. (In gutenberg-typist's UI a mismatch highlights red but does not block the cursor, so nonzero values are normal; a typist who corrects every red character before finishing ends at 0.)
 - `corrections`: number of backspace-and-retype events resolving to a correct character.
 
@@ -137,7 +137,16 @@ Flagged records feed the existing `?` badge mechanism. Plausibility checks are a
 
 ## 9. Migration from bundle v0 (field-wise-max counters)
 
-Legacy lifetime-counter bundles cannot be losslessly converted to sessions. The migration is: emit one **synthetic session per machine** carrying the legacy totals, with `id` derived deterministically as UUIDv5 of `machine + "\n" + "legacy-v0"` under the fixed GT namespace UUID `8c8f6a1e-2b7d-4f5a-9c3e-747970697374`, `date` set to the migration date, and a `"legacy": true` marker field. Consumers SHOULD display legacy records in lifetime totals but exclude them from time-series and per-session leaderboards.
+Legacy lifetime-counter bundles cannot be losslessly converted to sessions. The migration is: emit one **synthetic session per machine** carrying the legacy totals, with a deterministic `id`, `date` set to the migration date, a `"legacy": true` marker field, **no `book` or `range`** (v0 counters carry no per-book data), and the original counter map preserved verbatim as `"legacy_counters"` (an unknown field per §2, so it survives every rewrite). Field mapping: `chars_typed` ← `total_chars`, `errors_uncorrected` ← `max(total_chars − correct_chars, 0)`, `active_ms` and `wall_ms` ← `total_time_seconds × 1000`.
+
+The deterministic id is derived by SHA-256 (UUIDv5 mandates SHA-1, which pure-VimScript emitters do not have): let `d` be the lowercase hex SHA-256 digest of the UTF-8 string `namespace + "\n" + machine + "\n" + "legacy-v0"` where `namespace` is the fixed GT namespace UUID `8c8f6a1e-2b7d-4f5a-9c3e-747970697374`; then
+
+```
+id = d[0:8] "-" d[8:12] "-8" d[13:16] "-" v d[17:20] "-" d[20:32]
+v  = hex((int(d[16], 16) & 0x3) | 0x8)
+```
+
+(the forced nibbles keep it shaped like a version-8 UUID). Consumers SHOULD display legacy records in lifetime totals but exclude them from time-series and per-session leaderboards.
 
 Migration runs exactly once, **on the machine that owns the counters** (where the authoritative `lifetime_stats.json` lives). Old-format (v0 `format_version`) bundles are not importable elsewhere: a stale v0 export migrated on a second machine would mint the same deterministic `id` with different totals — the one conflict §4 forbids. Importers encountering a v0 bundle MUST refuse with guidance to update the plugin on the source machine and re-export. New exports append real sessions alongside the legacy record.
 
@@ -152,3 +161,6 @@ Amendments made during implementation, per repo owner's ruling; each is a review
 3. **§5.1: "keystrokes" → "input events".** Emitters measure idle gaps at input-event granularity; gutenberg-typist observes buffer text-change events, not raw keystrokes.
 4. **§5.2 parenthetical corrected.** The draft claimed gutenberg-typist's cursor cannot advance past a mismatch; the shipped UI highlights mismatches red and does not block, so nonzero `errors_uncorrected` is the normal case.
 5. **§9: legacy id drops `user` from the UUIDv5 name; fixed namespace pinned.** The owning machine may not know the GitHub login at migration time, and cross-user id collisions are harmless because consumers key sessions per authenticated user. Migration is restricted to the owning machine and v0 bundles are refused by importers, making the deterministic-id/differing-totals conflict unreachable.
+6. **§3/§9: legacy records omit `book` and `range`, and carry `legacy_counters`.** v0 counters have no per-book data to put in a `book` object; the original counter map rides along as an unknown field so nothing is lost.
+7. **§3/§5.2: `chars_typed` description corrected.** The draft said "i.e. correct-final characters", which contradicts §5.3 (Net WPM subtracts errors *from* `chars_typed`) and §6 (`errors_uncorrected <= chars_typed`). It is the final transcript length.
+8. **§9: deterministic id via SHA-256 truncation, not UUIDv5.** UUIDv5 mandates SHA-1; Vim ships only `sha256()`. The derivation is pinned exactly (digest slicing + forced nibbles) so any two implementations agree.
