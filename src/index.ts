@@ -1,14 +1,11 @@
 import {
-  CleanBundle,
-  Machines,
-  Row,
-  Sessions,
-  SUSPICIOUS_WPM,
   MAX_BUNDLE_BYTES,
-  derive,
-  loadBundle,
-  mergeMachines,
-  mergeSessions,
+  Row,
+  SessionRecord,
+  canonicalJson,
+  deriveRow,
+  isImplausible,
+  parseBundle,
 } from "./bundle";
 import {
   CLEAR_SESSION_COOKIE,
@@ -22,9 +19,9 @@ import {
 } from "./auth";
 
 const UPLOAD_THROTTLE_SECONDS = 30;
-// Rate slack on delta anti-cheat: sustained typing above 1.5x the suspicious
-// WPM ceiling between two uploads flags the submission.
-const DELTA_WPM_CEILING = SUSPICIOUS_WPM * 1.5;
+// D1 caps bound parameters around 100 per statement; the id-existence
+// lookup binds user_id + a chunk of session ids.
+const ID_CHUNK = 50;
 
 const json = (
   data: unknown,
@@ -38,129 +35,29 @@ const json = (
 
 // ── Board ──────────────────────────────────────────────────────────────────
 
-interface UserState {
-  id: number;
-  login: string;
-  bundle: CleanBundle;
-  flagged: boolean;
-}
-
-async function loadUserState(
-  env: Env,
-  userId: number,
-): Promise<UserState | null> {
-  const user = await env.DB.prepare(
-    "SELECT id, login, banned_at FROM users WHERE id = ?1",
-  )
-    .bind(userId)
-    .first<{ id: number; login: string; banned_at: number | null }>();
-  if (!user) return null;
-  const machines = await env.DB.prepare(
-    "SELECT machine_id, counters_json, updated_at FROM machines WHERE user_id = ?1",
-  )
-    .bind(userId)
-    .all<{ machine_id: string; counters_json: string; updated_at: number }>();
-  const sessions = await env.DB.prepare(
-    "SELECT * FROM book_sessions WHERE user_id = ?1",
-  )
-    .bind(userId)
-    .all<{
-      book_id: number;
-      offset: number;
-      total_chars_typed: number | null;
-      correct_chars: number | null;
-      last_active: number | null;
-    }>();
-  const machineMap: Machines = {};
-  let exportedAt = 0;
-  for (const m of machines.results) {
-    machineMap[m.machine_id] = JSON.parse(m.counters_json);
-    exportedAt = Math.max(exportedAt, m.updated_at);
-  }
-  const sessionMap: Sessions = {};
-  for (const s of sessions.results) {
-    sessionMap[String(s.book_id)] = {
-      book_id: s.book_id,
-      offset: s.offset,
-      ...(s.total_chars_typed !== null && {
-        total_chars_typed: s.total_chars_typed,
-      }),
-      ...(s.correct_chars !== null && { correct_chars: s.correct_chars }),
-      ...(s.last_active !== null && { last_active: s.last_active }),
-    };
-  }
-  return {
-    id: user.id,
-    login: user.login,
-    bundle: {
-      machines: machineMap,
-      sessions: sessionMap,
-      exported_at: exportedAt,
-    },
-    flagged: false,
-  };
-}
+type FlaggedRecord = SessionRecord & { flagged: boolean };
 
 async function boardRows(env: Env): Promise<Row[]> {
   const users = await env.DB.prepare(
     "SELECT id, login FROM users WHERE banned_at IS NULL",
   ).all<{ id: number; login: string }>();
-  const machines = await env.DB.prepare(
-    "SELECT user_id, machine_id, counters_json, updated_at FROM machines",
-  ).all<{
-    user_id: number;
-    machine_id: string;
-    counters_json: string;
-    updated_at: number;
-  }>();
-  const sessions = await env.DB.prepare("SELECT * FROM book_sessions").all<{
-    user_id: number;
-    book_id: number;
-    offset: number;
-    total_chars_typed: number | null;
-    correct_chars: number | null;
-    last_active: number | null;
-  }>();
-  const flagged = await env.DB.prepare(
-    "SELECT DISTINCT user_id FROM submissions WHERE flagged = 1",
-  ).all<{ user_id: number }>();
-  const flaggedIds = new Set(flagged.results.map((r) => r.user_id));
+  const sessions = await env.DB.prepare(
+    "SELECT user_id, flagged, canonical_json FROM sessions",
+  ).all<{ user_id: number; flagged: number; canonical_json: string }>();
 
-  const byUser = new Map<number, UserState>();
-  for (const u of users.results) {
-    byUser.set(u.id, {
-      id: u.id,
-      login: u.login,
-      bundle: { machines: {}, sessions: {}, exported_at: 0 },
-      flagged: flaggedIds.has(u.id),
-    });
-  }
-  for (const m of machines.results) {
-    const state = byUser.get(m.user_id);
-    if (!state) continue;
-    state.bundle.machines[m.machine_id] = JSON.parse(m.counters_json);
-    state.bundle.exported_at = Math.max(state.bundle.exported_at, m.updated_at);
-  }
+  const byUser = new Map<number, FlaggedRecord[]>();
   for (const s of sessions.results) {
-    const state = byUser.get(s.user_id);
-    if (!state) continue;
-    state.bundle.sessions[String(s.book_id)] = {
-      book_id: s.book_id,
-      offset: s.offset,
-      ...(s.total_chars_typed !== null && {
-        total_chars_typed: s.total_chars_typed,
-      }),
-      ...(s.correct_chars !== null && { correct_chars: s.correct_chars }),
-      ...(s.last_active !== null && { last_active: s.last_active }),
-    };
+    const record = JSON.parse(s.canonical_json) as SessionRecord;
+    const list = byUser.get(s.user_id) ?? [];
+    list.push(Object.assign(record, { flagged: s.flagged === 1 }));
+    byUser.set(s.user_id, list);
   }
 
   const rows: Row[] = [];
-  for (const state of byUser.values()) {
-    if (!Object.keys(state.bundle.machines).length) continue; // account, no stats yet
-    const row = derive(state.login, state.bundle);
-    row.suspicious = row.suspicious || state.flagged;
-    rows.push(row);
+  for (const u of users.results) {
+    const records = byUser.get(u.id);
+    if (!records?.length) continue; // account exists, no stats yet
+    rows.push(deriveRow(u.login, u.id < 0, records));
   }
   rows.sort((a, b) => b.best_wpm - a.best_wpm || a.user.localeCompare(b.user));
   return rows;
@@ -211,73 +108,97 @@ async function handleUpload(env: Env, request: Request): Promise<Response> {
 
   const now = Math.floor(Date.now() / 1000);
   const lastSub = await env.DB.prepare(
-    "SELECT received_at, total_chars FROM submissions WHERE user_id = ?1 ORDER BY received_at DESC LIMIT 1",
+    "SELECT received_at FROM submissions WHERE user_id = ?1 ORDER BY received_at DESC LIMIT 1",
   )
     .bind(userId)
-    .first<{ received_at: number; total_chars: number }>();
+    .first<{ received_at: number }>();
   if (lastSub && now - lastSub.received_at < UPLOAD_THROTTLE_SECONDS) {
     return json({ error: "too fast — wait 30 seconds between uploads" }, 429);
   }
 
   const body = await request.text();
-  const { bundle, error } = loadBundle(body);
+  const { bundle, error } = parseBundle(body);
   if (!bundle) return json({ error }, 400);
-
-  const state = await loadUserState(env, userId);
-  const local = state?.bundle ?? { machines: {}, sessions: {}, exported_at: 0 };
-  const mergedMachines = mergeMachines(local.machines, bundle.machines);
-  const mergedSessions = mergeSessions(local.sessions, bundle.sessions);
-
-  // Delta anti-cheat: chars gained since the previous upload, against the
-  // wall-clock time between uploads. First upload is exempt (it may carry
-  // months of legitimate history).
-  const sumChars = (m: Machines) =>
-    Object.values(m).reduce((acc, r) => acc + (r.total_chars ?? 0), 0);
-  const deltaChars = sumChars(mergedMachines) - sumChars(local.machines);
-  let flagged = 0;
-  if (lastSub && deltaChars > 0) {
-    const elapsedMinutes = (now - lastSub.received_at) / 60;
-    if (deltaChars / 5 / elapsedMinutes > DELTA_WPM_CEILING) flagged = 1;
+  // SPEC §2: a user field, when present, must match the authenticated
+  // submitter — it exists to catch uploading someone else's export.
+  if (bundle.user !== undefined && bundle.user !== user.login) {
+    return json(
+      {
+        error: `bundle user ${JSON.stringify(bundle.user)} does not match authenticated user ${JSON.stringify(user.login)}`,
+      },
+      403,
+    );
   }
 
-  // ponytail: read-merge-write without a transaction across requests; the
-  // 30 s throttle prevents same-user races and union-max means a replayed
-  // upload repairs any lost write.
-  const statements = [
-    ...Object.entries(mergedMachines).map(([machineId, counters]) =>
-      env.DB.prepare(
-        `INSERT INTO machines (user_id, machine_id, counters_json, updated_at)
-         VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(user_id, machine_id) DO UPDATE SET counters_json = ?3, updated_at = ?4`,
-      ).bind(userId, machineId, JSON.stringify(counters), now),
-    ),
-    ...Object.values(mergedSessions).map((s) =>
-      env.DB.prepare(
-        `INSERT INTO book_sessions (user_id, book_id, offset, total_chars_typed, correct_chars, last_active)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(user_id, book_id) DO UPDATE SET offset = ?3,
-           total_chars_typed = ?4, correct_chars = ?5, last_active = ?6`,
-      ).bind(
-        userId,
-        s.book_id,
-        s.offset,
-        s.total_chars_typed ?? null,
-        s.correct_chars ?? null,
-        s.last_active ?? null,
-      ),
-    ),
-    env.DB.prepare(
-      `INSERT INTO submissions (user_id, received_at, bundle_sha256, total_chars, flagged)
-       VALUES (?1, ?2, ?3, ?4, ?5)`,
+  const canonical = new Map(
+    bundle.sessions.map((r) => [r.id, canonicalJson(r)]),
+  );
+  const existing = new Map<string, string>();
+  const ids = [...canonical.keys()];
+  for (let i = 0; i < ids.length; i += ID_CHUNK) {
+    const chunk = ids.slice(i, i + ID_CHUNK);
+    const placeholders = chunk.map((_, j) => `?${j + 2}`).join(",");
+    const res = await env.DB.prepare(
+      `SELECT id, canonical_json FROM sessions WHERE user_id = ?1 AND id IN (${placeholders})`,
+    )
+      .bind(userId, ...chunk)
+      .all<{ id: string; canonical_json: string }>();
+    for (const r of res.results) existing.set(r.id, r.canonical_json);
+  }
+
+  const conflicts: string[] = [];
+  const fresh: SessionRecord[] = [];
+  for (const r of bundle.sessions) {
+    const prior = existing.get(r.id);
+    if (prior === undefined) fresh.push(r);
+    else if (prior !== canonical.get(r.id)) conflicts.push(r.id);
+    // byte-identical → set union makes the record a no-op
+  }
+  if (conflicts.length) {
+    return json(
+      {
+        error:
+          "records conflict with already-uploaded sessions — a session is immutable once created",
+        conflicting_ids: conflicts,
+      },
+      409,
+    );
+  }
+
+  let anyFlagged = 0;
+  const statements = fresh.map((r) => {
+    const flagged = isImplausible(r) ? 1 : 0;
+    anyFlagged = anyFlagged || flagged;
+    return env.DB.prepare(
+      `INSERT INTO sessions (user_id, id, machine, date, book_id, title,
+         active_ms, wall_ms, chars_typed, errors_uncorrected, corrections,
+         legacy, flagged, canonical_json, received_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)`,
     ).bind(
       userId,
-      now,
-      await sha256Hex(body),
-      sumChars(mergedMachines),
+      r.id,
+      r.machine,
+      r.date,
+      r.book?.gutenberg_id ?? null,
+      r.book?.title ?? null,
+      r.active_ms,
+      r.wall_ms,
+      r.chars_typed,
+      r.errors_uncorrected,
+      r.corrections ?? null,
+      r.legacy === true ? 1 : 0,
       flagged,
-    ),
-  ];
-  await env.DB.batch(statements);
+      canonical.get(r.id)!,
+      now,
+    );
+  });
+  statements.push(
+    env.DB.prepare(
+      `INSERT INTO submissions (user_id, received_at, bundle_sha256, new_sessions, flagged)
+       VALUES (?1, ?2, ?3, ?4, ?5)`,
+    ).bind(userId, now, await sha256Hex(body), fresh.length, anyFlagged),
+  );
+  await env.DB.batch(statements); // D1 batch is transactional
 
   const rows = await boardRows(env);
   const rank = rows.findIndex((r) => r.user === user.login) + 1;
@@ -288,7 +209,9 @@ async function handleUpload(env: Env, request: Request): Promise<Response> {
     rank,
     total_users: rows.length,
     best_wpm: row?.best_wpm ?? 0,
-    suspicious: row?.suspicious ?? flagged === 1,
+    new_sessions: fresh.length,
+    total_sessions: row?.sessions ?? 0,
+    suspicious: row?.suspicious ?? anyFlagged === 1,
   });
 }
 
@@ -380,8 +303,8 @@ async function upload(file) {
     return;
   }
   result.textContent =
-    "merged — you are #" + data.rank + " of " + data.total_users +
-    " (best " + data.best_wpm + " wpm)" +
+    "merged " + data.new_sessions + " new session(s) — you are #" + data.rank +
+    " of " + data.total_users + " (best " + data.best_wpm + " wpm)" +
     (data.suspicious ? " — flagged as implausible, honor system!" : "");
 }
 
