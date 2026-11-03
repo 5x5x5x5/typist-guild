@@ -327,9 +327,10 @@ document.getElementById("gen-token").addEventListener("click", async () => {
     "  -H 'Authorization: Bearer " + data.token + "' \\\\\\n" +
     "  --data-binary @$HOME/gutenberg-typist-export.json";
   document.getElementById("vim-line").textContent =
+    "runtime extras/guild/plugin/gt_guild.vim\\n" +
     "let g:gt_hub_url = '" + location.origin + "'\\n" +
     "let g:gt_hub_token = '" + data.token + "'\\n" +
-    '" then just :GT publish';
+    '" then just :GTGuildPublish';
   document.getElementById("token-out").hidden = false;
 });
 </script>
