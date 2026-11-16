@@ -62,7 +62,7 @@ if [ "$UPSTREAM" = "origin" ]; then
     echo "push rejected (someone pushed first) — run submit again" >&2
     exit 1
   fi
-  echo "pushed — live at https://5x5x5x5.github.io/typist-guild/ in ~1 minute"
+  echo "pushed — live at https://danielsiegle.com/typist-guild/ in ~1 minute"
 else
   git push -q origin HEAD:main
   if command -v gh >/dev/null 2>&1; then

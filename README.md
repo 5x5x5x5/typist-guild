@@ -5,7 +5,7 @@ graduate to typing real books with the
 [gutenberg-typist](https://github.com/5x5x5x5/gutenberg-typist) Vim plugin,
 then put your stats on the board here.
 
-**The board: <https://5x5x5x5.github.io/typist-guild/>**
+**The board: <https://danielsiegle.com/typist-guild/>**
 
 The current residents are fictional — seed data, characters typing their own
 books (usernames like `mina-harker-1897` link nowhere on purpose). Every seat
